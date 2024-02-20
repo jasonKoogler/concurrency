@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io/fs"
 	"log"
@@ -11,20 +12,33 @@ import (
 )
 
 // Result represents a positive search result, it will be the name of the file
-type Result string
+type Result struct {
+	Filename   string
+	LineNumber int
+	Text       string
+}
+
+// NewResult helper function for creating a new result object
+func NewResult(fileName string, lineNumber int, text string) Result {
+	return Result{
+		Filename:   fileName,
+		LineNumber: lineNumber,
+		Text:       text,
+	}
+}
 
 // ResultMsg represents the message passed to through the channel, it will contain
 // either a [Data] string or an [Err] error
 type ResultMsg struct {
-	Data Result
+	Data []Result
 	Err  error
 }
 
 // NewResultMsg is a constructor function for creating a ResultMsg more easily
 // the data parameter will be caste to a Result to simplify usage.
-func NewResultMsg(data string, err error) *ResultMsg {
+func NewResultMsg(data []Result, err error) *ResultMsg {
 	return &ResultMsg{
-		Data: Result(data),
+		Data: data,
 		Err:  err,
 	}
 }
@@ -33,16 +47,25 @@ func NewResultMsg(data string, err error) *ResultMsg {
 type JobManager struct {
 	wg          *sync.WaitGroup
 	resultmsgch chan *ResultMsg
-	result      []*Result
+	result      *[]Result
 	readDone    *sync.WaitGroup
 }
 
 // Newworker create a new instance of the JobManager object
-func NewJobManager() *JobManager {
+func NewJobManager(numFiles int) *JobManager {
+	var bufferSize int
+	if numFiles >= 3 {
+		bufferSize = 5
+	} else if numFiles > 50 && numFiles <= 1000 {
+		bufferSize = 10
+	} else if numFiles > 1000 {
+		bufferSize = 100
+	}
+
 	return &JobManager{
 		wg:          new(sync.WaitGroup),
-		resultmsgch: make(chan *ResultMsg),
-		result:      []*Result{},
+		resultmsgch: make(chan *ResultMsg, bufferSize),
+		result:      new([]Result),
 		readDone:    new(sync.WaitGroup),
 	}
 }
@@ -53,7 +76,7 @@ func NewJobManager() *JobManager {
 //
 // todo: create higher level functions that grab files from dirs, dirs in dirs, or a list of dirs
 // ---- then call search files
-func (jm *JobManager) SearchFiles(term string, files ...fs.DirEntry) []*Result {
+func (jm *JobManager) SearchFiles(term string, files ...fs.DirEntry) *[]Result {
 	jm.readDone.Add(1)
 
 	go jm.searchWorkerReceive()
@@ -77,31 +100,51 @@ func (jm *JobManager) SearchFiles(term string, files ...fs.DirEntry) []*Result {
 // it sends either an error or a result to the resultmsgch
 func (jm *JobManager) searchWorkerSend(file string, term string) {
 	defer jm.wg.Done()
-	b, err := os.ReadFile(file)
+	f, err := os.Open(file)
 	if err != nil {
-		jm.resultmsgch <- NewResultMsg("", err)
+		jm.resultmsgch <- NewResultMsg(nil, err)
 		return
 	}
-	if byteToStringSearchForTerm(b, term) {
-		jm.resultmsgch <- NewResultMsg(file, nil)
-	}
+	defer f.Close()
+
+	jm.resultmsgch <- scanByLine(f, term)
 }
 
+// searchWorkerReceive receives values from the resultmsg channel
+// so the channel wont block further goroutine access
+// !! should be run in its own goroutine
 func (jm *JobManager) searchWorkerReceive() {
 	defer jm.readDone.Done()
 	for msg := range jm.resultmsgch {
 		if msg.Err != nil {
 			log.Println("Error reading file: ", msg.Err)
 		} else {
-			jm.result = append(jm.result, &msg.Data)
+			*jm.result = append(*jm.result, msg.Data...)
 		}
 	}
 }
 
-// byteToStringSearchForTerm converts bytes to string and then searches for a match
-func byteToStringSearchForTerm(b []byte, term string) bool {
-	content := string(b)
-	return strings.Contains(content, term)
+// scanByLine takes an os.File and a term to search for and
+// scans the file line by line for the term, adding all
+// positive results to the ResultMsg as well as errors
+func scanByLine(file *os.File, term string) *ResultMsg {
+	scanner := bufio.NewScanner(file)
+	lineNum := 1
+	resultmsg := new(ResultMsg)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if strings.Contains(text, term) {
+			resultmsg.Data = append(resultmsg.Data, NewResult(file.Name(), lineNum, term))
+		}
+		lineNum++
+	}
+
+	if err := scanner.Err(); err != nil {
+		resultmsg.Err = err
+		return resultmsg
+	}
+
+	return resultmsg
 }
 
 func main() {
@@ -120,13 +163,14 @@ func main() {
 		log.Fatalf("error changing working directory: %s", err)
 	}
 
-	jm := NewJobManager()
+	jm := NewJobManager(len(files))
 
-	jm.SearchFiles("the", files...)
+	jm.SearchFiles("and", files...)
 
 	os.Chdir(pwd)
 
-	for _, addr := range jm.result {
-		fmt.Println(*addr)
+	for _, found := range *jm.result {
+		fmt.Println(found)
 	}
+
 }
